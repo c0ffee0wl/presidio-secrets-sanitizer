@@ -31,6 +31,14 @@ if platform.system() == 'Windows':
         HAS_MSVCRT = False
 else:
     HAS_MSVCRT = False
+
+# Import watchdog for file watching functionality
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    HAS_WATCHDOG = True
+except ImportError:
+    HAS_WATCHDOG = False
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Set
 import requests
@@ -1279,6 +1287,182 @@ class PresidioSecretsIntegrator:
             self.logger.error(f"Error saving mapping table: {e}")
             raise
 
+class RobustFileWatcher:
+    """Cross-platform file watcher for continuous sanitization."""
+    
+    def __init__(self, integrator, watch_file: Path, output_file: Path):
+        self.integrator = integrator
+        self.watch_file = watch_file
+        self.watch_dir = watch_file.parent
+        self.output_file = output_file
+        self.logger = logging.getLogger(__name__)
+        self.observer = None
+        self.processing_lock = threading.Lock()
+        self.shutdown_event = threading.Event()
+        
+        if not HAS_WATCHDOG:
+            raise RuntimeError("Watchdog library not available. Install with: pip install watchdog")
+        
+        self._setup_signal_handlers()
+    
+    def _setup_signal_handlers(self):
+        def signal_handler(signum, frame):
+            self.logger.info(f"Received signal {signum}, stopping file watcher")
+            self.stop_watching()
+        
+        try:
+            signal.signal(signal.SIGINT, signal_handler)
+            if hasattr(signal, 'SIGTERM'):
+                signal.signal(signal.SIGTERM, signal_handler)
+            if platform.system() == 'Windows' and hasattr(signal, 'SIGBREAK'):
+                signal.signal(signal.SIGBREAK, signal_handler)
+        except Exception as e:
+            self.logger.warning(f"Could not setup signal handlers: {e}")
+    
+    def _process_file_safely(self, file_path: Path):
+        """Process a file with robust error handling."""
+        try:
+            # Only process the specific file we're watching
+            if file_path != self.watch_file:
+                return
+                
+            if not file_path.exists() or not file_path.is_file():
+                return
+            
+            with self.processing_lock:
+                if self.shutdown_event.is_set():
+                    return
+                
+                self.logger.info(f"Processing watched file: {file_path}")
+                
+                # Use the existing file processor
+                processor = RobustFileProcessor(self.integrator, file_path, None)
+                lines = processor.read_input_file_robust()
+                
+                if not lines:
+                    return
+                
+                # Process lines
+                processed_lines = []
+                for i, line in enumerate(lines):
+                    if self.shutdown_event.is_set():
+                        break
+                    processed_line = processor.process_line_robust(line, i)
+                    processed_lines.append(processed_line)
+                
+                # Write complete processed content to output file (no metadata)
+                if processed_lines and not self.shutdown_event.is_set():
+                    self._write_to_output(processed_lines)
+                
+        except Exception as e:
+            self.logger.error(f"Error processing {file_path}: {e}")
+    
+    def _write_to_output(self, processed_lines: List[str]):
+        """Write processed lines to output file, replacing previous content."""
+        try:
+            self.output_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Use temp file for atomic write
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False, 
+                                           dir=self.output_file.parent, 
+                                           prefix=f"{self.output_file.name}.tmp.") as temp_file:
+                temp_path = Path(temp_file.name)
+                
+                try:
+                    # Write ONLY the processed content - NO metadata
+                    for line in processed_lines:
+                        temp_file.write(line + '\n')
+                    
+                    temp_file.flush()
+                    if hasattr(os, 'fsync'):
+                        os.fsync(temp_file.fileno())
+                    
+                    # Atomic move (works on both Unix and Windows)
+                    temp_path.replace(self.output_file)
+                    
+                    self.logger.info(f"Updated output file with {len(processed_lines)} processed lines")
+                    
+                except Exception as e:
+                    # Cleanup temp file on error
+                    try:
+                        temp_path.unlink()
+                    except:
+                        pass
+                    raise e
+            
+        except Exception as e:
+            self.logger.error(f"Error writing to output file: {e}")
+    
+    def start_watching(self):
+        """Start watching the file for changes."""
+        if not self.watch_file.exists():
+            raise FileNotFoundError(f"Watch file does not exist: {self.watch_file}")
+        
+        if not self.watch_file.is_file():
+            raise ValueError(f"Watch path is not a file: {self.watch_file}")
+        
+        class FileEventHandler(FileSystemEventHandler):
+            def __init__(self, watcher):
+                self.watcher = watcher
+                super().__init__()
+            
+            def on_created(self, event):
+                if not event.is_directory:
+                    file_path = Path(event.src_path)
+                    self.watcher.logger.debug(f"File created: {file_path}")
+                    # Small delay to ensure file is fully written
+                    threading.Timer(0.5, self.watcher._process_file_safely, args=[file_path]).start()
+            
+            def on_modified(self, event):
+                if not event.is_directory:
+                    file_path = Path(event.src_path)
+                    self.watcher.logger.debug(f"File modified: {file_path}")
+                    # Small delay to ensure file is fully written
+                    threading.Timer(0.5, self.watcher._process_file_safely, args=[file_path]).start()
+        
+        try:
+            self.observer = Observer()
+            event_handler = FileEventHandler(self)
+            self.observer.schedule(event_handler, str(self.watch_dir), recursive=False)
+            
+            self.observer.start()
+            self.logger.info(f"Started watching file: {self.watch_file}")
+            self.logger.info(f"Output will be written to: {self.output_file}")
+            
+            # Process the file initially
+            self._process_file_safely(self.watch_file)
+            
+            # Keep the main thread alive
+            try:
+                while not self.shutdown_event.is_set():
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                self.logger.info("Keyboard interrupt received")
+            
+        except Exception as e:
+            self.logger.error(f"Error starting file watcher: {e}")
+            raise
+        finally:
+            self.stop_watching()
+    
+    def stop_watching(self):
+        """Stop the file watcher."""
+        self.shutdown_event.set()
+        
+        if self.observer and self.observer.is_alive():
+            self.observer.stop()
+            self.observer.join(timeout=5.0)
+            self.logger.info("File watcher stopped")
+        
+        # Process the watched file one final time if recently modified
+        try:
+            if self.watch_file.exists():
+                # Check if file was recently modified (within last 10 seconds)
+                if time.time() - self.watch_file.stat().st_mtime < 10:
+                    self._process_file_safely(self.watch_file)
+        except Exception as e:
+            self.logger.warning(f"Error in final file processing: {e}")
+
 def create_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog='presidio-secrets-pseudonymizer',
@@ -1297,6 +1481,9 @@ Examples:
   
   # Stdin processing (NO mapping file allowed)
   cat input.txt | %(prog)s --stdin -o output.txt
+  
+  # Watchdog mode (NO mapping file allowed)
+  %(prog)s --watchdog /path/to/file.txt -o output.txt
         """
     )
     
@@ -1304,6 +1491,7 @@ Examples:
     parser.add_argument('--stdin', action='store_true', help='Process stdin input')
     parser.add_argument('-o', '--output', type=Path, help='Output file or directory')
     parser.add_argument('--mapping-file', type=Path, help='Entity mappings file (file mode only)')
+    parser.add_argument('--watchdog', type=Path, help='Watch a specific file for changes and sanitize continuously')
     parser.add_argument('--refresh-patterns', action='store_true', help='Force refresh of pattern cache')
     parser.add_argument('--cache-dir', type=Path, help='Pattern cache directory')
     parser.add_argument('--quiet', action='store_true', help='Suppress progress output')
@@ -1327,18 +1515,29 @@ async def main_async():
         logger.info("Starting robust pseudonymization tool")
         
         # Validate arguments
+        mode_count = sum([bool(args.stdin), bool(args.watchdog), bool(args.input_files)])
+        if mode_count != 1:
+            logger.error("Must specify exactly one mode: input files, --stdin, or --watchdog")
+            sys.exit(1)
+        
         if args.stdin:
-            if args.input_files:
-                logger.error("Cannot specify input files with --stdin mode")
-                sys.exit(1)
             if args.mapping_file:
                 logger.error("Mapping file not allowed with --stdin mode")
                 sys.exit(1)
-        else:
-            if not args.input_files:
-                logger.error("Must specify input files or use --stdin mode")
+        elif args.watchdog:
+            if not args.output:
+                logger.error("Output file (-o) required with --watchdog mode")
                 sys.exit(1)
-            
+            if args.mapping_file:
+                logger.error("Mapping file not allowed with --watchdog mode")
+                sys.exit(1)
+            if not args.watchdog.exists():
+                logger.error(f"Watch file does not exist: {args.watchdog}")
+                sys.exit(1)
+            if not args.watchdog.is_file():
+                logger.error(f"Watch path is not a file: {args.watchdog}")
+                sys.exit(1)
+        else:
             for input_file in args.input_files:
                 if not input_file.exists():
                     logger.error(f"Input file does not exist: {input_file}")
@@ -1353,6 +1552,10 @@ async def main_async():
         
         if args.stdin:
             await integrator.process_stdin_async(args.output)
+        elif args.watchdog:
+            # Watchdog mode
+            watcher = RobustFileWatcher(integrator, args.watchdog, args.output)
+            watcher.start_watching()
         else:
             # File mode
             results = integrator.process_files(args.input_files, args.output)
