@@ -493,28 +493,7 @@ class RobustAsyncLineProcessor:
         
         self.stdin_closed = False
         self.processing_cancelled = False
-        
-        self._setup_signal_handlers()
     
-    def _setup_signal_handlers(self):
-        def signal_handler(signum, frame):
-            self.logger.info(f"Received signal {signum}, initiating graceful shutdown")
-            self.processing_cancelled = True
-        
-        try:
-            # SIGINT (Ctrl+C) is available on both Unix and Windows
-            signal.signal(signal.SIGINT, signal_handler)
-            
-            # SIGTERM is Unix-only, only set if available
-            if hasattr(signal, 'SIGTERM'):
-                signal.signal(signal.SIGTERM, signal_handler)
-            
-            # Windows-specific signals
-            if platform.system() == 'Windows':
-                if hasattr(signal, 'SIGBREAK'):
-                    signal.signal(signal.SIGBREAK, signal_handler)
-        except Exception as e:
-            self.logger.warning(f"Could not setup signal handlers: {e}")
     
     async def read_stdin_robust(self) -> List[str]:
         """Read stdin with robust error handling."""
@@ -539,7 +518,7 @@ class RobustAsyncLineProcessor:
             line_count = 0
             
             try:
-                while not self.processing_cancelled:
+                while not self.processing_cancelled and not _shutdown_event.is_set():
                     try:
                         line_bytes = await asyncio.wait_for(reader.readline(), timeout=60.0)
                         
@@ -588,7 +567,7 @@ class RobustAsyncLineProcessor:
             if not line.strip():
                 return line
             
-            if self.processing_cancelled:
+            if self.processing_cancelled or _shutdown_event.is_set():
                 return line
             
             loop = asyncio.get_event_loop()
@@ -653,7 +632,7 @@ class RobustAsyncLineProcessor:
             processed_lines = []
             
             for i, line in enumerate(input_lines):
-                if self.processing_cancelled:
+                if self.processing_cancelled or _shutdown_event.is_set():
                     self.logger.warning(f"Processing cancelled at line {i+1}/{len(input_lines)}")
                     break
                 
@@ -703,28 +682,7 @@ class RobustFileProcessor:
         self.instance_id = f"file_{uuid.uuid4().hex[:8]}"
         self.start_time = time.time()
         self.processing_cancelled = False
-        
-        self._setup_signal_handlers()
     
-    def _setup_signal_handlers(self):
-        def signal_handler(signum, frame):
-            self.logger.info(f"Received signal {signum}, initiating graceful shutdown")
-            self.processing_cancelled = True
-        
-        try:
-            # SIGINT (Ctrl+C) is available on both Unix and Windows
-            signal.signal(signal.SIGINT, signal_handler)
-            
-            # SIGTERM is Unix-only, only set if available
-            if hasattr(signal, 'SIGTERM'):
-                signal.signal(signal.SIGTERM, signal_handler)
-            
-            # Windows-specific signals
-            if platform.system() == 'Windows':
-                if hasattr(signal, 'SIGBREAK'):
-                    signal.signal(signal.SIGBREAK, signal_handler)
-        except Exception as e:
-            self.logger.warning(f"Could not setup signal handlers: {e}")
     
     def read_input_file_robust(self) -> List[str]:
         """Read input file with robust error handling."""
@@ -746,7 +704,7 @@ class RobustFileProcessor:
             
             with open(self.input_file, 'r', encoding='utf-8', errors='replace') as f:
                 for line_num, line in enumerate(f, 1):
-                    if self.processing_cancelled:
+                    if self.processing_cancelled or _shutdown_event.is_set():
                         self.logger.info(f"Reading cancelled at line {line_num}")
                         break
                     
@@ -779,7 +737,7 @@ class RobustFileProcessor:
             if not line.strip():
                 return line
             
-            if self.processing_cancelled:
+            if self.processing_cancelled or _shutdown_event.is_set():
                 return line
             
             analyzer_results = self.integrator.analyze_text(line)
@@ -815,8 +773,9 @@ class RobustFileProcessor:
             self.output_file.parent.mkdir(parents=True, exist_ok=True)
             
             # Use temp directory for atomic writes
+            temp_dir = Path(tempfile.gettempdir())
             with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False, 
-                                           dir=self.output_file.parent, 
+                                           dir=temp_dir, 
                                            prefix=f"{self.output_file.name}.tmp.") as temp_file:
                 
                 temp_path = Path(temp_file.name)
@@ -880,7 +839,7 @@ class RobustFileProcessor:
             processed_lines = []
             
             for i, line in enumerate(input_lines):
-                if self.processing_cancelled:
+                if self.processing_cancelled or _shutdown_event.is_set():
                     self.logger.warning(f"Processing cancelled at line {i+1}/{len(input_lines)}")
                     results["errors"].append(f"Processing cancelled at line {i+1}")
                     break
@@ -1261,8 +1220,9 @@ class PresidioSecretsIntegrator:
             mapping_file.parent.mkdir(parents=True, exist_ok=True)
             
             # Use temp file for atomic write
+            temp_dir = Path(tempfile.gettempdir())
             with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False, 
-                                           dir=mapping_file.parent, 
+                                           dir=temp_dir, 
                                            prefix=f"{mapping_file.name}.tmp.") as temp_file:
                 temp_path = Path(temp_file.name)
                 
@@ -1290,7 +1250,7 @@ class PresidioSecretsIntegrator:
 class RobustFileWatcher:
     """Cross-platform file watcher for continuous sanitization."""
     
-    def __init__(self, integrator, watch_file: Path, output_file: Path):
+    def __init__(self, integrator, watch_file: Path, output_file: Path, shutdown_event: threading.Event):
         self.integrator = integrator
         self.watch_file = watch_file
         self.watch_dir = watch_file.parent
@@ -1298,29 +1258,89 @@ class RobustFileWatcher:
         self.logger = logging.getLogger(__name__)
         self.observer = None
         self.processing_lock = threading.Lock()
-        self.shutdown_event = threading.Event()
+        self.shutdown_event = shutdown_event  # Use global shutdown event
+        self.temp_files = set()  # Track temp files for cleanup
+        
+        # Track file position for incremental reading
+        self.last_position = 0
+        self.last_size = 0
+        self.last_inode = None
         
         if not HAS_WATCHDOG:
             raise RuntimeError("Watchdog library not available. Install with: pip install watchdog")
         
-        self._setup_signal_handlers()
+        # Register cleanup on exit
+        atexit.register(self._cleanup_temp_files)
     
-    def _setup_signal_handlers(self):
-        def signal_handler(signum, frame):
-            self.logger.info(f"Received signal {signum}, stopping file watcher")
-            self.stop_watching()
-        
+    def _cleanup_temp_files(self):
+        """Clean up any remaining temp files."""
+        for temp_file in list(self.temp_files):
+            try:
+                if temp_file.exists():
+                    temp_file.unlink()
+                self.temp_files.discard(temp_file)
+            except Exception:
+                pass
+    
+    def _read_new_lines(self) -> List[str]:
+        """Read only new lines since last check."""
         try:
-            signal.signal(signal.SIGINT, signal_handler)
-            if hasattr(signal, 'SIGTERM'):
-                signal.signal(signal.SIGTERM, signal_handler)
-            if platform.system() == 'Windows' and hasattr(signal, 'SIGBREAK'):
-                signal.signal(signal.SIGBREAK, signal_handler)
+            if not self.watch_file.exists():
+                return []
+            
+            stat = self.watch_file.stat()
+            current_size = stat.st_size
+            current_inode = stat.st_ino
+            
+            # Check if file was truncated or rotated
+            if (self.last_inode is not None and 
+                (current_inode != self.last_inode or current_size < self.last_position)):
+                self.logger.info("File truncated or rotated, starting from beginning")
+                self.last_position = 0
+                self.last_size = 0
+            
+            # Update tracking
+            self.last_inode = current_inode
+            
+            # No new data
+            if current_size <= self.last_position:
+                return []
+            
+            new_lines = []
+            with open(self.watch_file, 'r', encoding='utf-8', errors='replace') as f:
+                # Seek to last position
+                f.seek(self.last_position)
+                
+                # Read new content
+                new_content = f.read(current_size - self.last_position)
+                
+                # Update position
+                self.last_position = current_size
+                self.last_size = current_size
+                
+                # Split into lines, handling partial lines
+                if new_content:
+                    lines = new_content.split('\n')
+                    
+                    # If the content doesn't end with newline, the last "line" is incomplete
+                    # We'll process it anyway as some log files don't end with newlines
+                    for line in lines:
+                        # Skip empty lines that result from splitting
+                        if line or (line == '' and new_content.endswith('\n')):
+                            new_lines.append(line.rstrip('\r'))
+                    
+                    # Remove the last empty line if content ended with newline
+                    if new_content.endswith('\n') and new_lines and new_lines[-1] == '':
+                        new_lines.pop()
+            
+            return new_lines
+            
         except Exception as e:
-            self.logger.warning(f"Could not setup signal handlers: {e}")
+            self.logger.error(f"Error reading new lines from {self.watch_file}: {e}")
+            return []
     
     def _process_file_safely(self, file_path: Path):
-        """Process a file with robust error handling."""
+        """Process only new lines from the watched file."""
         try:
             # Only process the specific file we're watching
             if file_path != self.watch_file:
@@ -1333,62 +1353,143 @@ class RobustFileWatcher:
                 if self.shutdown_event.is_set():
                     return
                 
-                self.logger.info(f"Processing watched file: {file_path}")
+                # Read only new lines since last check
+                new_lines = self._read_new_lines()
                 
-                # Use the existing file processor
-                processor = RobustFileProcessor(self.integrator, file_path, None)
-                lines = processor.read_input_file_robust()
-                
-                if not lines:
+                if not new_lines:
+                    self.logger.debug(f"No new lines in {file_path}")
                     return
                 
-                # Process lines
+                self.logger.info(f"Processing {len(new_lines)} new lines from {file_path}")
+                
+                # Process only the new lines
                 processed_lines = []
-                for i, line in enumerate(lines):
+                for i, line in enumerate(new_lines):
                     if self.shutdown_event.is_set():
                         break
-                    processed_line = processor.process_line_robust(line, i)
-                    processed_lines.append(processed_line)
+                    
+                    # Use the integrator directly for line processing
+                    try:
+                        analyzer_results = self.integrator.analyze_text(line)
+                        self.integrator.stats.lines_processed += 1
+                        
+                        if analyzer_results:
+                            self.integrator.stats.lines_with_findings += 1
+                            self.integrator.stats.entities_found += len(analyzer_results)
+                            
+                            secrets_count = sum(1 for r in analyzer_results if r.entity_type.startswith('SECRET_'))
+                            self.integrator.stats.secrets_found += secrets_count
+                            
+                            processed_line = self.integrator.pseudonymize_text(line, analyzer_results)
+                            processed_lines.append(processed_line)
+                        else:
+                            processed_lines.append(line)
+                            
+                    except Exception as e:
+                        self.logger.error(f"Error processing line {i+1}: {e}")
+                        processed_lines.append(line)  # Keep original line on error
                 
-                # Write complete processed content to output file (no metadata)
+                # Append only the new processed lines to output file
                 if processed_lines and not self.shutdown_event.is_set():
-                    self._write_to_output(processed_lines)
+                    self._append_new_lines(processed_lines)
                 
         except Exception as e:
             self.logger.error(f"Error processing {file_path}: {e}")
+    
+    def _append_new_lines(self, processed_lines: List[str]):
+        """Append new processed lines to output file."""
+        try:
+            self.output_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Append new lines to output file
+            with open(self.output_file, 'a', encoding='utf-8') as f:
+                try:
+                    if HAS_FCNTL and not platform.system() == 'Windows':
+                        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                    elif platform.system() == 'Windows' and HAS_MSVCRT:
+                        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                except (OSError, IOError):
+                    pass
+                
+                try:
+                    # Write ONLY the new processed lines - NO metadata
+                    for line in processed_lines:
+                        f.write(line + '\n')
+                    
+                    f.flush()
+                    if hasattr(os, 'fsync'):
+                        os.fsync(f.fileno())
+                    
+                finally:
+                    try:
+                        if HAS_FCNTL and not platform.system() == 'Windows':
+                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                        elif platform.system() == 'Windows' and HAS_MSVCRT:
+                            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                    except (OSError, IOError):
+                        pass
+            
+            self.logger.info(f"Appended {len(processed_lines)} new processed lines to {self.output_file}")
+            
+        except Exception as e:
+            self.logger.error(f"Error appending to output file: {e}")
     
     def _write_to_output(self, processed_lines: List[str]):
         """Write processed lines to output file, replacing previous content."""
         try:
             self.output_file.parent.mkdir(parents=True, exist_ok=True)
             
-            # Use temp file for atomic write
-            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False, 
-                                           dir=self.output_file.parent, 
-                                           prefix=f"{self.output_file.name}.tmp.") as temp_file:
-                temp_path = Path(temp_file.name)
-                
+            if platform.system() == 'Windows':
+                # Windows-specific approach - direct write without temp file
+                # Windows file locking can prevent atomic rename
                 try:
-                    # Write ONLY the processed content - NO metadata
-                    for line in processed_lines:
-                        temp_file.write(line + '\n')
-                    
-                    temp_file.flush()
-                    if hasattr(os, 'fsync'):
-                        os.fsync(temp_file.fileno())
-                    
-                    # Atomic move (works on both Unix and Windows)
-                    temp_path.replace(self.output_file)
+                    with open(self.output_file, 'w', encoding='utf-8') as f:
+                        for line in processed_lines:
+                            f.write(line + '\n')
+                        f.flush()
+                        if hasattr(os, 'fsync'):
+                            os.fsync(f.fileno())
                     
                     self.logger.info(f"Updated output file with {len(processed_lines)} processed lines")
                     
                 except Exception as e:
-                    # Cleanup temp file on error
+                    self.logger.error(f"Error writing to output file: {e}")
+            else:
+                # Unix/Linux - use atomic temp file approach
+                temp_dir = Path(tempfile.gettempdir())
+                with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False, 
+                                               dir=temp_dir, 
+                                               prefix=f"{self.output_file.name}.tmp.") as temp_file:
+                    temp_path = Path(temp_file.name)
+                    
                     try:
-                        temp_path.unlink()
-                    except:
-                        pass
-                    raise e
+                        # Write ONLY the processed content - NO metadata
+                        for line in processed_lines:
+                            temp_file.write(line + '\n')
+                        
+                        temp_file.flush()
+                        if hasattr(os, 'fsync'):
+                            os.fsync(temp_file.fileno())
+                        
+                        # Track temp file for cleanup
+                        self.temp_files.add(temp_path)
+                        
+                        # Atomic move (Unix/Linux)
+                        temp_path.replace(self.output_file)
+                        
+                        # Remove from tracking after successful move
+                        self.temp_files.discard(temp_path)
+                        
+                        self.logger.info(f"Updated output file with {len(processed_lines)} processed lines")
+                        
+                    except Exception as e:
+                        # Cleanup temp file on error
+                        try:
+                            temp_path.unlink()
+                            self.temp_files.discard(temp_path)
+                        except:
+                            pass
+                        raise e
             
         except Exception as e:
             self.logger.error(f"Error writing to output file: {e}")
@@ -1411,14 +1512,16 @@ class RobustFileWatcher:
                     file_path = Path(event.src_path)
                     self.watcher.logger.debug(f"File created: {file_path}")
                     # Small delay to ensure file is fully written
-                    threading.Timer(0.5, self.watcher._process_file_safely, args=[file_path]).start()
+                    if not self.watcher.shutdown_event.is_set():
+                        threading.Timer(0.5, self.watcher._process_file_safely, args=[file_path]).start()
             
             def on_modified(self, event):
                 if not event.is_directory:
                     file_path = Path(event.src_path)
                     self.watcher.logger.debug(f"File modified: {file_path}")
                     # Small delay to ensure file is fully written
-                    threading.Timer(0.5, self.watcher._process_file_safely, args=[file_path]).start()
+                    if not self.watcher.shutdown_event.is_set():
+                        threading.Timer(0.5, self.watcher._process_file_safely, args=[file_path]).start()
         
         try:
             self.observer = Observer()
@@ -1429,15 +1532,35 @@ class RobustFileWatcher:
             self.logger.info(f"Started watching file: {self.watch_file}")
             self.logger.info(f"Output will be written to: {self.output_file}")
             
-            # Process the file initially
-            self._process_file_safely(self.watch_file)
+            # Initialize file position tracking and process existing content
+            if self.watch_file.exists():
+                stat = self.watch_file.stat()
+                self.last_inode = stat.st_ino
+                
+                # Process existing content first
+                self.logger.info(f"Processing existing content in {self.watch_file}")
+                self.last_position = 0  # Start from beginning
+                self.last_size = 0
+                
+                # Process the existing content
+                self._process_file_safely(self.watch_file)
+                
+                # Now set position to end for future incremental processing
+                stat = self.watch_file.stat()  # Re-read stat in case file changed
+                self.last_position = stat.st_size
+                self.last_size = stat.st_size
+                self.logger.info(f"Finished processing existing content, now watching for new additions")
+            else:
+                self.logger.info("File does not exist yet, will process when created")
             
-            # Keep the main thread alive
+            # Keep the main thread alive and handle signals
             try:
                 while not self.shutdown_event.is_set():
-                    time.sleep(1)
+                    time.sleep(0.1)  # Shorter sleep for more responsive signal handling
             except KeyboardInterrupt:
                 self.logger.info("Keyboard interrupt received")
+                self.stop_watching()
+                return  # Exit the method to stop watching
             
         except Exception as e:
             self.logger.error(f"Error starting file watcher: {e}")
@@ -1447,18 +1570,25 @@ class RobustFileWatcher:
     
     def stop_watching(self):
         """Stop the file watcher."""
+        self.logger.info("Stopping file watcher...")
         self.shutdown_event.set()
         
         if self.observer and self.observer.is_alive():
             self.observer.stop()
-            self.observer.join(timeout=5.0)
-            self.logger.info("File watcher stopped")
+            self.observer.join(timeout=3.0)
+            if self.observer.is_alive():
+                self.logger.warning("Observer did not stop gracefully")
+            else:
+                self.logger.info("File watcher stopped")
+        
+        # Clean up temp files
+        self._cleanup_temp_files()
         
         # Process the watched file one final time if recently modified
         try:
-            if self.watch_file.exists():
-                # Check if file was recently modified (within last 10 seconds)
-                if time.time() - self.watch_file.stat().st_mtime < 10:
+            if self.watch_file.exists() and not self.shutdown_event.is_set():
+                # Check if file was recently modified (within last 5 seconds)
+                if time.time() - self.watch_file.stat().st_mtime < 5:
                     self._process_file_safely(self.watch_file)
         except Exception as e:
             self.logger.warning(f"Error in final file processing: {e}")
@@ -1553,9 +1683,9 @@ async def main_async():
         if args.stdin:
             await integrator.process_stdin_async(args.output)
         elif args.watchdog:
-            # Watchdog mode
-            watcher = RobustFileWatcher(integrator, args.watchdog, args.output)
-            watcher.start_watching()
+            # Watchdog mode is handled by main_sync(), this should not be reached
+            logger.error("Watchdog mode should use main_sync() entry point")
+            sys.exit(1)
         else:
             # File mode
             results = integrator.process_files(args.input_files, args.output)
@@ -1579,14 +1709,108 @@ async def main_async():
         logger.debug("Full traceback:", exc_info=True)
         sys.exit(1)
 
+
+# Global shutdown event and current watcher reference
+_shutdown_event = threading.Event()
+_current_watcher = None
+_current_logger = None
+
+def setup_global_signal_handlers():
+    """Setup signal handlers that work for all modes."""
+    def signal_handler(signum, frame):
+        if _current_logger:
+            _current_logger.info(f"Received signal {signum}, initiating shutdown")
+        
+        # Set global shutdown event
+        _shutdown_event.set()
+        
+        # Stop watchdog if running
+        if _current_watcher:
+            try:
+                _current_watcher.stop_watching()
+            except Exception as e:
+                if _current_logger:
+                    _current_logger.error(f"Error stopping watcher: {e}")
+        
+        if _current_logger:
+            _current_logger.info("Exiting...")
+        sys.exit(0)
+    
+    try:
+        signal.signal(signal.SIGINT, signal_handler)
+        if hasattr(signal, 'SIGTERM'):
+            signal.signal(signal.SIGTERM, signal_handler)
+        if platform.system() == 'Windows' and hasattr(signal, 'SIGBREAK'):
+            signal.signal(signal.SIGBREAK, signal_handler)
+    except Exception as e:
+        if _current_logger:
+            _current_logger.warning(f"Could not setup signal handlers: {e}")
+
 def main():
     """Main entry point with exception handling."""
+    global _current_logger, _current_watcher
+    
+    parser = create_argument_parser()
+    args = parser.parse_args()
+    
+    # Setup logging first
+    _current_logger = setup_logging(
+        args.log_level, 
+        str(args.debug_log) if args.debug_log else None, 
+        args.quiet
+    )
+    
+    # Setup global signal handlers
+    setup_global_signal_handlers()
+    
     try:
-        asyncio.run(main_async())
+        if args.watchdog:
+            # Synchronous watchdog mode
+            _current_logger.info("Starting robust pseudonymization tool (watchdog mode)")
+            
+            # Validate arguments
+            mode_count = sum([bool(args.stdin), bool(args.watchdog), bool(args.input_files)])
+            if mode_count != 1:
+                _current_logger.error("Must specify exactly one mode: input files, --stdin, or --watchdog")
+                sys.exit(1)
+                
+            if not args.output:
+                _current_logger.error("Output file (-o) required with --watchdog mode")
+                sys.exit(1)
+            if args.mapping_file:
+                _current_logger.error("Mapping file not allowed with --watchdog mode")
+                sys.exit(1)
+            if not args.watchdog.exists():
+                _current_logger.error(f"Watch file does not exist: {args.watchdog}")
+                sys.exit(1)
+            if not args.watchdog.is_file():
+                _current_logger.error(f"Watch path is not a file: {args.watchdog}")
+                sys.exit(1)
+            
+            # Initialize integrator
+            integrator = PresidioSecretsIntegrator(args.cache_dir, args.quiet)
+            pattern_count = integrator.load_secrets_patterns(args.refresh_patterns)
+            
+            if pattern_count == 0:
+                _current_logger.warning("No patterns loaded, continuing with built-in recognizers only")
+            
+            # Create and start watcher
+            _current_watcher = RobustFileWatcher(integrator, args.watchdog, args.output, _shutdown_event)
+            _current_watcher.start_watching()
+            
+        else:
+            # Async mode for stdin and file processing
+            asyncio.run(main_async())
+            
     except KeyboardInterrupt:
-        sys.exit(1)
+        _current_logger.info("Processing interrupted by user")
+        sys.exit(0)
     except Exception as e:
-        print(f"Fatal error: {e}", file=sys.stderr)
+        if _current_logger:
+            _current_logger.error(f"Critical error: {e}")
+            _current_logger.debug("Full traceback:", exc_info=True)
+        else:
+            print(f"Fatal error: {e}", file=sys.stderr)
         sys.exit(1)
 
 if __name__ == '__main__':
