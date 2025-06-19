@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Presidio + secrets-patterns-db Integration Script
 Robust version with temp directory for all state files
@@ -11,10 +12,25 @@ import sys
 import time
 import yaml
 import asyncio
-import fcntl
 import os
 import struct
 import signal
+import platform
+try:
+    import fcntl
+    HAS_FCNTL = True
+except ImportError:
+    HAS_FCNTL = False
+
+# Import Windows-specific module if on Windows
+if platform.system() == 'Windows':
+    try:
+        import msvcrt
+        HAS_MSVCRT = True
+    except ImportError:
+        HAS_MSVCRT = False
+else:
+    HAS_MSVCRT = False
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Set
 import requests
@@ -54,6 +70,7 @@ class RobustSequenceManager:
         self.sequence_file = self.temp_dir / "sequence"
         self.lock_file = self.temp_dir / "sequence.lock"
         self.logger = logging.getLogger(__name__)
+        self.is_windows = platform.system() == 'Windows'
         
         self._ensure_files()
         atexit.register(self._cleanup)
@@ -97,6 +114,20 @@ class RobustSequenceManager:
             self.logger.error(f"Error validating sequence file: {e}")
             raise
     
+    def _acquire_file_lock(self, f):
+        """Cross-platform file locking."""
+        if HAS_FCNTL and not self.is_windows:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif self.is_windows and HAS_MSVCRT:
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+    
+    def _release_file_lock(self, f):
+        """Cross-platform file lock release."""
+        if HAS_FCNTL and not self.is_windows:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        elif self.is_windows and HAS_MSVCRT:
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+    
     def get_next_sequence(self) -> int:
         max_retries = 100
         base_delay = 0.001
@@ -108,10 +139,19 @@ class RobustSequenceManager:
                 
                 while (time.time() - lock_start) < 5.0:
                     try:
-                        lock_fd = os.open(str(self.lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                        lock_acquired = True
-                        break
-                    except FileExistsError:
+                        if self.is_windows:
+                            # Windows doesn't support O_EXCL reliably, use different approach
+                            if not self.lock_file.exists():
+                                with open(self.lock_file, 'w') as lf:
+                                    lf.write(f"{os.getpid()}\n{time.time()}\n{attempt}\n")
+                                lock_acquired = True
+                                lock_fd = None
+                                break
+                        else:
+                            lock_fd = os.open(str(self.lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                            lock_acquired = True
+                            break
+                    except (FileExistsError, OSError):
                         await_time = base_delay * (attempt + 1)
                         time.sleep(min(await_time, 0.1))
                     except Exception:
@@ -121,12 +161,17 @@ class RobustSequenceManager:
                     continue
                 
                 try:
-                    lock_info = f"{os.getpid()}\n{time.time()}\n{attempt}\n".encode()
-                    os.write(lock_fd, lock_info)
-                    os.fsync(lock_fd)
+                    if not self.is_windows and lock_fd is not None:
+                        lock_info = f"{os.getpid()}\n{time.time()}\n{attempt}\n".encode()
+                        os.write(lock_fd, lock_info)
+                        os.fsync(lock_fd)
                     
                     with open(self.sequence_file, 'r+b') as f:
-                        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        try:
+                            self._acquire_file_lock(f)
+                        except (OSError, IOError):
+                            # If file locking fails, continue without it (less safe but functional)
+                            pass
                         
                         try:
                             f.seek(0)
@@ -143,17 +188,23 @@ class RobustSequenceManager:
                             f.seek(0)
                             f.write(struct.pack('Q', next_seq))
                             f.flush()
-                            os.fsync(f.fileno())
+                            if hasattr(os, 'fsync'):
+                                os.fsync(f.fileno())
                             
                             return current_seq
                             
                         finally:
-                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                            try:
+                                self._release_file_lock(f)
+                            except (OSError, IOError):
+                                pass
                             
                 finally:
                     try:
-                        os.close(lock_fd)
-                        self.lock_file.unlink()
+                        if not self.is_windows and lock_fd is not None:
+                            os.close(lock_fd)
+                        if self.lock_file.exists():
+                            self.lock_file.unlink()
                     except:
                         pass
                         
@@ -178,6 +229,7 @@ class RobustOrderedFileWriter:
         self.pending_writes: Dict[int, tuple] = {}
         self.next_write_seq = 0
         self.logger = logging.getLogger(__name__)
+        self.is_windows = platform.system() == 'Windows'
         
         self.written_sequences: Set[int] = set()
         self.max_wait_time = 300.0
@@ -196,11 +248,32 @@ class RobustOrderedFileWriter:
         except:
             pass
     
+    def _acquire_file_lock(self, f, shared=False):
+        """Cross-platform file locking."""
+        if HAS_FCNTL and not self.is_windows:
+            lock_type = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+            fcntl.flock(f.fileno(), lock_type)
+        elif self.is_windows and HAS_MSVCRT:
+            # Windows file locking is always exclusive
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+    
+    def _release_file_lock(self, f):
+        """Cross-platform file lock release."""
+        if HAS_FCNTL and not self.is_windows:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        elif self.is_windows and HAS_MSVCRT:
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+    
     def _load_written_state(self):
         try:
             if self.written_file.exists():
                 with open(self.written_file, 'rb') as f:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                    try:
+                        self._acquire_file_lock(f, shared=True)
+                    except (OSError, IOError):
+                        # Continue without locking if it fails
+                        pass
+                    
                     try:
                         data = f.read()
                         if len(data) >= 8:
@@ -218,7 +291,10 @@ class RobustOrderedFileWriter:
                         else:
                             self._save_written_state(0)
                     finally:
-                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                        try:
+                            self._release_file_lock(f)
+                        except (OSError, IOError):
+                            pass
             else:
                 self._save_written_state(0)
                 
@@ -236,9 +312,11 @@ class RobustOrderedFileWriter:
                 json_data = json.dumps(written_list).encode('utf-8')
                 f.write(json_data)
                 f.flush()
-                os.fsync(f.fileno())
+                if hasattr(os, 'fsync'):
+                    os.fsync(f.fileno())
             
-            temp_written.rename(self.written_file)
+            # Atomic rename works on both Unix and Windows
+            temp_written.replace(self.written_file)
             
         except Exception as e:
             self.logger.error(f"Could not save written state: {e}")
@@ -264,7 +342,11 @@ class RobustOrderedFileWriter:
             self.output_file.parent.mkdir(parents=True, exist_ok=True)
             
             with open(self.output_file, 'a', encoding='utf-8') as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    self._acquire_file_lock(f)
+                except (OSError, IOError):
+                    # Continue without locking if it fails
+                    pass
                 
                 try:
                     self._load_written_state()
@@ -295,11 +377,15 @@ class RobustOrderedFileWriter:
                             break
                     
                     if written_count > 0:
-                        os.fsync(f.fileno())
+                        if hasattr(os, 'fsync'):
+                            os.fsync(f.fileno())
                         self._save_written_state(self.next_write_seq)
                     
                 finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    try:
+                        self._release_file_lock(f)
+                    except (OSError, IOError):
+                        pass
                     
         except Exception as e:
             self.logger.error(f"Error in write attempt: {e}")
@@ -342,7 +428,11 @@ class RobustOrderedFileWriter:
         """Force write remaining sequences - CLEAN CONTENT ONLY."""
         try:
             with open(self.output_file, 'a', encoding='utf-8') as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    self._acquire_file_lock(f)
+                except (OSError, IOError):
+                    pass
+                
                 try:
                     for seq_num in sorted(self.pending_writes.keys()):
                         content, metadata, queue_time, retries = self.pending_writes[seq_num]
@@ -353,10 +443,14 @@ class RobustOrderedFileWriter:
                         self.logger.warning(f"Force-wrote sequence {seq_num}: {metadata}")
                     
                     f.flush()
-                    os.fsync(f.fileno())
+                    if hasattr(os, 'fsync'):
+                        os.fsync(f.fileno())
                     
                 finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    try:
+                        self._release_file_lock(f)
+                    except (OSError, IOError):
+                        pass
                     
             self.pending_writes.clear()
             
@@ -387,8 +481,17 @@ class RobustAsyncLineProcessor:
             self.processing_cancelled = True
         
         try:
-            signal.signal(signal.SIGTERM, signal_handler)
+            # SIGINT (Ctrl+C) is available on both Unix and Windows
             signal.signal(signal.SIGINT, signal_handler)
+            
+            # SIGTERM is Unix-only, only set if available
+            if hasattr(signal, 'SIGTERM'):
+                signal.signal(signal.SIGTERM, signal_handler)
+            
+            # Windows-specific signals
+            if platform.system() == 'Windows':
+                if hasattr(signal, 'SIGBREAK'):
+                    signal.signal(signal.SIGBREAK, signal_handler)
         except Exception as e:
             self.logger.warning(f"Could not setup signal handlers: {e}")
     
@@ -588,8 +691,17 @@ class RobustFileProcessor:
             self.processing_cancelled = True
         
         try:
-            signal.signal(signal.SIGTERM, signal_handler)
+            # SIGINT (Ctrl+C) is available on both Unix and Windows
             signal.signal(signal.SIGINT, signal_handler)
+            
+            # SIGTERM is Unix-only, only set if available
+            if hasattr(signal, 'SIGTERM'):
+                signal.signal(signal.SIGTERM, signal_handler)
+            
+            # Windows-specific signals
+            if platform.system() == 'Windows':
+                if hasattr(signal, 'SIGBREAK'):
+                    signal.signal(signal.SIGBREAK, signal_handler)
         except Exception as e:
             self.logger.warning(f"Could not setup signal handlers: {e}")
     
@@ -694,10 +806,11 @@ class RobustFileProcessor:
                         temp_file.write(line + '\n')
                     
                     temp_file.flush()
-                    os.fsync(temp_file.fileno())
+                    if hasattr(os, 'fsync'):
+                        os.fsync(temp_file.fileno())
                     
-                    # Atomic move
-                    temp_path.rename(self.output_file)
+                    # Atomic move (works on both Unix and Windows)
+                    temp_path.replace(self.output_file)
                     self.logger.info(f"Successfully wrote {len(processed_lines)} lines to {self.output_file}")
                     return True
                     
@@ -1135,10 +1248,11 @@ class PresidioSecretsIntegrator:
                 try:
                     json.dump(self.entity_mapping, temp_file, indent=2, ensure_ascii=False)
                     temp_file.flush()
-                    os.fsync(temp_file.fileno())
+                    if hasattr(os, 'fsync'):
+                        os.fsync(temp_file.fileno())
                     
-                    # Atomic move
-                    temp_path.rename(mapping_file)
+                    # Atomic move (works on both Unix and Windows)
+                    temp_path.replace(mapping_file)
                     self.logger.info(f"Mapping table saved to: {mapping_file}")
                     
                 except Exception as e:
