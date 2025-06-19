@@ -202,8 +202,7 @@ class RobustSequenceManager:
                             f.write(struct.pack('Q', next_seq))
                             f.flush()
                             if hasattr(os, 'fsync'):
-                                if hasattr(os, 'fsync'):
-                        os.fsync(f.fileno())
+                                os.fsync(f.fileno())
                             
                             return current_seq
                             
@@ -327,8 +326,7 @@ class RobustOrderedFileWriter:
                 f.write(json_data)
                 f.flush()
                 if hasattr(os, 'fsync'):
-                    if hasattr(os, 'fsync'):
-                        os.fsync(f.fileno())
+                    os.fsync(f.fileno())
             
             # Atomic rename works on both Unix and Windows
             temp_written.replace(self.written_file)
@@ -393,8 +391,7 @@ class RobustOrderedFileWriter:
                     
                     if written_count > 0:
                         if hasattr(os, 'fsync'):
-                            if hasattr(os, 'fsync'):
-                        os.fsync(f.fileno())
+                            os.fsync(f.fileno())
                         self._save_written_state(self.next_write_seq)
                     
                 finally:
@@ -460,7 +457,6 @@ class RobustOrderedFileWriter:
                     
                     f.flush()
                     if hasattr(os, 'fsync'):
-                        if hasattr(os, 'fsync'):
                         os.fsync(f.fileno())
                     
                 finally:
