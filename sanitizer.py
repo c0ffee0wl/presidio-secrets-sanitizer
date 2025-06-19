@@ -1257,7 +1257,6 @@ class RobustFileWatcher:
         self.output_file = output_file
         self.logger = logging.getLogger(__name__)
         self.observer = None
-        self.processing_lock = threading.Lock()
         self.shutdown_event = shutdown_event  # Use global shutdown event
         self.temp_files = set()  # Track temp files for cleanup
         
@@ -1282,157 +1281,72 @@ class RobustFileWatcher:
             except Exception:
                 pass
     
-    def _read_new_lines(self) -> List[str]:
-        """Read only new lines since last check."""
+    def _process_immediately(self):
+        """Process new content immediately - based on reference implementation."""
+        if self.shutdown_event.is_set():
+            return
+            
         try:
-            if not self.watch_file.exists():
-                return []
-            
-            stat = self.watch_file.stat()
-            current_size = stat.st_size
-            current_inode = stat.st_ino
-            
-            # Check if file was truncated or rotated
-            if (self.last_inode is not None and 
-                (current_inode != self.last_inode or current_size < self.last_position)):
-                self.logger.info("File truncated or rotated, starting from beginning")
-                self.last_position = 0
-                self.last_size = 0
-            
-            # Update tracking
-            self.last_inode = current_inode
-            
-            # No new data
-            if current_size <= self.last_position:
-                return []
-            
-            new_lines = []
-            with open(self.watch_file, 'r', encoding='utf-8', errors='replace') as f:
-                # Seek to last position
+            with open(self.watch_file, 'r', encoding='utf-8', errors='ignore') as f:
                 f.seek(self.last_position)
-                
-                # Read new content
-                new_content = f.read(current_size - self.last_position)
-                
-                # Update position
-                self.last_position = current_size
-                self.last_size = current_size
-                
-                # Split into lines, handling partial lines
-                if new_content:
-                    lines = new_content.split('\n')
-                    
-                    # If the content doesn't end with newline, the last "line" is incomplete
-                    # We'll process it anyway as some log files don't end with newlines
-                    for line in lines:
-                        # Skip empty lines that result from splitting
-                        if line or (line == '' and new_content.endswith('\n')):
-                            new_lines.append(line.rstrip('\r'))
-                    
-                    # Remove the last empty line if content ended with newline
-                    if new_content.endswith('\n') and new_lines and new_lines[-1] == '':
-                        new_lines.pop()
+                new_content = f.read()
+                self.last_position = f.tell()
             
-            return new_lines
-            
-        except Exception as e:
-            self.logger.error(f"Error reading new lines from {self.watch_file}: {e}")
-            return []
-    
-    def _process_file_safely(self, file_path: Path):
-        """Process only new lines from the watched file."""
-        try:
-            # Only process the specific file we're watching
-            if file_path != self.watch_file:
-                return
+            if new_content:
+                # Process the new content directly
+                processed_content = self._process_content(new_content)
                 
-            if not file_path.exists() or not file_path.is_file():
-                return
-            
-            with self.processing_lock:
-                if self.shutdown_event.is_set():
-                    return
-                
-                # Read only new lines since last check
-                new_lines = self._read_new_lines()
-                
-                if not new_lines:
-                    self.logger.debug(f"No new lines in {file_path}")
-                    return
-                
-                self.logger.info(f"Processing {len(new_lines)} new lines from {file_path}")
-                
-                # Process only the new lines
-                processed_lines = []
-                for i, line in enumerate(new_lines):
-                    if self.shutdown_event.is_set():
-                        break
-                    
-                    # Use the integrator directly for line processing
-                    try:
-                        analyzer_results = self.integrator.analyze_text(line)
-                        self.integrator.stats.lines_processed += 1
-                        
-                        if analyzer_results:
-                            self.integrator.stats.lines_with_findings += 1
-                            self.integrator.stats.entities_found += len(analyzer_results)
-                            
-                            secrets_count = sum(1 for r in analyzer_results if r.entity_type.startswith('SECRET_'))
-                            self.integrator.stats.secrets_found += secrets_count
-                            
-                            processed_line = self.integrator.pseudonymize_text(line, analyzer_results)
-                            processed_lines.append(processed_line)
-                        else:
-                            processed_lines.append(line)
-                            
-                    except Exception as e:
-                        self.logger.error(f"Error processing line {i+1}: {e}")
-                        processed_lines.append(line)  # Keep original line on error
-                
-                # Append only the new processed lines to output file
-                if processed_lines and not self.shutdown_event.is_set():
-                    self._append_new_lines(processed_lines)
-                
-        except Exception as e:
-            self.logger.error(f"Error processing {file_path}: {e}")
-    
-    def _append_new_lines(self, processed_lines: List[str]):
-        """Append new processed lines to output file."""
-        try:
-            self.output_file.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Append new lines to output file
-            with open(self.output_file, 'a', encoding='utf-8') as f:
-                try:
-                    if HAS_FCNTL and not platform.system() == 'Windows':
-                        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                    elif platform.system() == 'Windows' and HAS_MSVCRT:
-                        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-                except (OSError, IOError):
-                    pass
-                
-                try:
-                    # Write ONLY the new processed lines - NO metadata
-                    for line in processed_lines:
-                        f.write(line + '\n')
-                    
-                    f.flush()
+                # Append to output file immediately
+                with open(self.output_file, 'a', encoding='utf-8') as f_out:
+                    f_out.write(processed_content)
+                    f_out.flush()
                     if hasattr(os, 'fsync'):
-                        os.fsync(f.fileno())
-                    
-                finally:
-                    try:
-                        if HAS_FCNTL and not platform.system() == 'Windows':
-                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                        elif platform.system() == 'Windows' and HAS_MSVCRT:
-                            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
-                    except (OSError, IOError):
-                        pass
-            
-            self.logger.info(f"Appended {len(processed_lines)} new processed lines to {self.output_file}")
-            
+                        os.fsync(f_out.fileno())
+                
+                line_count = new_content.count('\n')
+                self.logger.info(f"Processed {line_count} new lines immediately")
+                
+        except IOError as e:
+            # Handle temporary file locks gracefully
+            self.logger.debug(f"Temporary file access error: {e}")
         except Exception as e:
-            self.logger.error(f"Error appending to output file: {e}")
+            self.logger.error(f"Error processing file: {e}")
+    
+    def _process_content(self, content: str) -> str:
+        """Process content string and return processed result."""
+        if not content.strip():
+            return content
+            
+        lines = content.split('\n')
+        processed_lines = []
+        
+        for line in lines:
+            if self.shutdown_event.is_set():
+                break
+                
+            try:
+                # Process line directly
+                analyzer_results = self.integrator.analyze_text(line)
+                self.integrator.stats.lines_processed += 1
+                
+                if analyzer_results:
+                    self.integrator.stats.lines_with_findings += 1
+                    self.integrator.stats.entities_found += len(analyzer_results)
+                    
+                    secrets_count = sum(1 for r in analyzer_results if r.entity_type.startswith('SECRET_'))
+                    self.integrator.stats.secrets_found += secrets_count
+                    
+                    processed_line = self.integrator.pseudonymize_text(line, analyzer_results)
+                    processed_lines.append(processed_line)
+                else:
+                    processed_lines.append(line)
+                    
+            except Exception as e:
+                self.logger.error(f"Error processing line: {e}")
+                processed_lines.append(line)  # Keep original on error
+        
+        return '\n'.join(processed_lines)
+    
     
     def _write_to_output(self, processed_lines: List[str]):
         """Write processed lines to output file, replacing previous content."""
@@ -1508,20 +1422,17 @@ class RobustFileWatcher:
                 super().__init__()
             
             def on_created(self, event):
-                if not event.is_directory:
-                    file_path = Path(event.src_path)
-                    self.watcher.logger.debug(f"File created: {file_path}")
-                    # Small delay to ensure file is fully written
-                    if not self.watcher.shutdown_event.is_set():
-                        threading.Timer(0.5, self.watcher._process_file_safely, args=[file_path]).start()
+                if not event.is_directory and Path(event.src_path) == self.watcher.watch_file:
+                    self.watcher.logger.debug(f"File created: {event.src_path}")
+                    # File was newly created, reset position and process
+                    self.watcher.last_position = 0
+                    self.watcher._process_immediately()
             
             def on_modified(self, event):
-                if not event.is_directory:
-                    file_path = Path(event.src_path)
-                    self.watcher.logger.debug(f"File modified: {file_path}")
-                    # Small delay to ensure file is fully written
-                    if not self.watcher.shutdown_event.is_set():
-                        threading.Timer(0.5, self.watcher._process_file_safely, args=[file_path]).start()
+                if not event.is_directory and Path(event.src_path) == self.watcher.watch_file:
+                    self.watcher.logger.debug(f"File modified: {event.src_path}")
+                    # Process immediately - no delay
+                    self.watcher._process_immediately()
         
         try:
             self.observer = Observer()
@@ -1542,8 +1453,8 @@ class RobustFileWatcher:
                 self.last_position = 0  # Start from beginning
                 self.last_size = 0
                 
-                # Process the existing content
-                self._process_file_safely(self.watch_file)
+                # Process the existing content immediately
+                self._process_immediately()
                 
                 # Now set position to end for future incremental processing
                 stat = self.watch_file.stat()  # Re-read stat in case file changed
