@@ -92,7 +92,8 @@ class RobustSequenceManager:
                 with open(self.sequence_file, 'wb') as f:
                     f.write(struct.pack('Q', 0))
                     f.flush()
-                    os.fsync(f.fileno())
+                    if hasattr(os, 'fsync'):
+                        os.fsync(f.fileno())
                 self.logger.debug(f"Created sequence file: {self.sequence_file}")
             else:
                 self._validate_sequence_file()
@@ -109,7 +110,8 @@ class RobustSequenceManager:
                     with open(self.sequence_file, 'wb') as fix_f:
                         fix_f.write(struct.pack('Q', 0))
                         fix_f.flush()
-                        os.fsync(fix_f.fileno())
+                        if hasattr(os, 'fsync'):
+                            os.fsync(fix_f.fileno())
         except Exception as e:
             self.logger.error(f"Error validating sequence file: {e}")
             raise
@@ -148,9 +150,19 @@ class RobustSequenceManager:
                                 lock_fd = None
                                 break
                         else:
-                            lock_fd = os.open(str(self.lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                            lock_acquired = True
-                            break
+                            # Use os.open with Unix-specific flags
+                            if hasattr(os, 'O_CREAT') and hasattr(os, 'O_EXCL') and hasattr(os, 'O_WRONLY'):
+                                lock_fd = os.open(str(self.lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                                lock_acquired = True
+                                break
+                            else:
+                                # Fallback for systems without these flags
+                                if not self.lock_file.exists():
+                                    with open(self.lock_file, 'w') as lf:
+                                        lf.write(f"{os.getpid()}\n{time.time()}\n{attempt}\n")
+                                    lock_acquired = True
+                                    lock_fd = None
+                                    break
                     except (FileExistsError, OSError):
                         await_time = base_delay * (attempt + 1)
                         time.sleep(min(await_time, 0.1))
@@ -164,7 +176,8 @@ class RobustSequenceManager:
                     if not self.is_windows and lock_fd is not None:
                         lock_info = f"{os.getpid()}\n{time.time()}\n{attempt}\n".encode()
                         os.write(lock_fd, lock_info)
-                        os.fsync(lock_fd)
+                        if hasattr(os, 'fsync'):
+                            os.fsync(lock_fd)
                     
                     with open(self.sequence_file, 'r+b') as f:
                         try:
@@ -189,7 +202,8 @@ class RobustSequenceManager:
                             f.write(struct.pack('Q', next_seq))
                             f.flush()
                             if hasattr(os, 'fsync'):
-                                os.fsync(f.fileno())
+                                if hasattr(os, 'fsync'):
+                        os.fsync(f.fileno())
                             
                             return current_seq
                             
@@ -313,7 +327,8 @@ class RobustOrderedFileWriter:
                 f.write(json_data)
                 f.flush()
                 if hasattr(os, 'fsync'):
-                    os.fsync(f.fileno())
+                    if hasattr(os, 'fsync'):
+                        os.fsync(f.fileno())
             
             # Atomic rename works on both Unix and Windows
             temp_written.replace(self.written_file)
@@ -378,7 +393,8 @@ class RobustOrderedFileWriter:
                     
                     if written_count > 0:
                         if hasattr(os, 'fsync'):
-                            os.fsync(f.fileno())
+                            if hasattr(os, 'fsync'):
+                        os.fsync(f.fileno())
                         self._save_written_state(self.next_write_seq)
                     
                 finally:
@@ -444,6 +460,7 @@ class RobustOrderedFileWriter:
                     
                     f.flush()
                     if hasattr(os, 'fsync'):
+                        if hasattr(os, 'fsync'):
                         os.fsync(f.fileno())
                     
                 finally:
