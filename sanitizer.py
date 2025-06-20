@@ -16,6 +16,8 @@ import os
 import struct
 import signal
 import platform
+import queue
+import threading
 try:
     import fcntl
     HAS_FCNTL = True
@@ -496,12 +498,17 @@ class RobustAsyncLineProcessor:
     
     
     async def read_stdin_robust(self) -> List[str]:
-        """Read stdin with robust error handling."""
+        """Read stdin with robust error handling for Windows and Unix."""
         try:
             if sys.stdin.isatty():
                 self.logger.error("No stdin data available (running in TTY)")
                 return []
             
+            # Windows-specific handling
+            if platform.system() == 'Windows':
+                return await self._read_stdin_windows()
+            
+            # Unix/Linux - inline for performance
             try:
                 loop = asyncio.get_event_loop()
                 reader = asyncio.StreamReader()
@@ -556,10 +563,92 @@ class RobustAsyncLineProcessor:
                            f"{len(lines)} lines, hash={input_hash}")
             
             return lines
-            
+                
         except Exception as e:
             self.logger.error(f"Error reading stdin: {e}")
             return []
+    
+    async def _read_stdin_windows(self) -> List[str]:
+        """Windows-specific stdin reading using thread executor."""
+        
+        lines = []
+        line_queue = queue.Queue()
+        error_queue = queue.Queue()
+        
+        def read_stdin_thread():
+            """Thread function to read stdin on Windows."""
+            try:
+                line_count = 0
+                for line in sys.stdin:
+                    if self.processing_cancelled or _shutdown_event.is_set():
+                        break
+                    
+                    line = line.rstrip('\r\n')
+                    line_queue.put(line)
+                    line_count += 1
+                    
+                    if line_count > 1000000:
+                        error_queue.put(f"Too many input lines: {line_count}, stopping")
+                        break
+                    
+                    if len(line) > 100000:
+                        self.logger.warning(f"Very long line ({len(line)} chars) on line {line_count}")
+                    
+                    if line_count % 5000 == 0:
+                        self.logger.debug(f"Read {line_count} lines")
+                
+                line_queue.put(None)  # EOF marker
+                
+            except Exception as e:
+                error_queue.put(f"Error in stdin thread: {e}")
+                line_queue.put(None)  # EOF marker
+        
+        # Start reading thread
+        reader_thread = threading.Thread(target=read_stdin_thread, daemon=True)
+        reader_thread.start()
+        
+        # Read lines from queue with timeout
+        loop = asyncio.get_event_loop()
+        line_count = 0
+        
+        while not self.processing_cancelled and not _shutdown_event.is_set():
+            try:
+                # Use run_in_executor to avoid blocking the event loop
+                line = await asyncio.wait_for(
+                    loop.run_in_executor(None, line_queue.get, True, 60.0),
+                    timeout=60.0
+                )
+                
+                if line is None:  # EOF marker
+                    break
+                
+                lines.append(line)
+                line_count += 1
+                
+            except (queue.Empty, asyncio.TimeoutError):
+                self.logger.warning("Timeout reading from stdin queue, assuming EOF")
+                break
+            except Exception as e:
+                self.logger.error(f"Error reading from stdin queue: {e}")
+                break
+        
+        # Check for errors
+        try:
+            error = error_queue.get_nowait()
+            self.logger.error(error)
+        except queue.Empty:
+            pass
+        
+        # Wait for thread to finish
+        reader_thread.join(timeout=5.0)
+        
+        input_hash = hashlib.md5('\n'.join(lines).encode('utf-8', errors='replace')).hexdigest()[:8]
+        self.logger.info(f"Read complete [seq={self.sequence_num}, instance={self.instance_id}]: "
+                       f"{len(lines)} lines, hash={input_hash}")
+        
+        self.stdin_closed = True
+        return lines
+    
     
     async def process_line_robust(self, line: str, line_index: int) -> str:
         """Process single line with error recovery."""
